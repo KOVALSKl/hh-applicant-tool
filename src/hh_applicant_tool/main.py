@@ -19,6 +19,7 @@ import requests
 import urllib3
 
 from . import ai, api, utils
+from .backends import ConfigBackend, CookieBackend, FileCookieBackend
 from .storage import StorageFacade
 from .utils.log import setup_logger
 from .utils.mixins import MegaTool
@@ -130,10 +131,16 @@ class HHApplicantTool(MegaTool):
         parser.set_defaults(run=None)
         return parser
 
-    def __init__(self, argv: Sequence[str] | None):
+    def __init__(
+        self,
+        argv: Sequence[str] | None,
+        config_backend: ConfigBackend | None = None,
+        cookie_backend: CookieBackend | None = None,
+    ):
+        self._config_backend = config_backend
+        self._cookie_backend = cookie_backend
         self._parse_args(argv)
 
-        # Создаем путь до конфига
         self.config_path.mkdir(
             parents=True,
             exist_ok=True,
@@ -170,7 +177,11 @@ class HHApplicantTool(MegaTool):
             logger.info("Use proxies for requests: %r", proxies)
             session.proxies = proxies
 
-        if self.cookies_file.exists():
+        jar = MozillaCookieJar()
+        if self._cookie_backend is not None:
+            self._cookie_backend.load_to_jar(jar)
+            session.cookies = jar
+        elif self.cookies_file.exists():
             jar = MozillaCookieJar(str(self.cookies_file))
             jar.load(ignore_discard=True, ignore_expires=True)
             session.cookies = jar
@@ -199,6 +210,8 @@ class HHApplicantTool(MegaTool):
 
     @cached_property
     def config(self) -> utils.Config:
+        if self._config_backend is not None:
+            return utils.Config(self._config_backend)
         return utils.Config(self.config_path / DEFAULT_CONFIG_FILENAME)
 
     @cached_property
@@ -291,8 +304,24 @@ class HHApplicantTool(MegaTool):
         return False
 
     def save_cookies(self) -> None:
-        """Сохраняет текущие куки сессии в файл."""
+        """Сохраняет текущие cookies сессии через бэкенд или в файл."""
         if not self.session.cookies:
+            return
+
+        if self._cookie_backend is not None:
+            if isinstance(self.session.cookies, MozillaCookieJar):
+                import io
+                buf = io.StringIO()
+                buf.write("# Netscape HTTP Cookie File\n")
+                for cookie in self.session.cookies:
+                    domain = cookie.domain
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = cookie.path or "/"
+                    secure = "TRUE" if cookie.secure else "FALSE"
+                    expires = int(cookie.expires or 0)
+                    buf.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
+                self._cookie_backend.save_from_text(buf.getvalue())
+                logger.debug("Cookies saved via backend")
             return
 
         if isinstance(self.session.cookies, MozillaCookieJar):

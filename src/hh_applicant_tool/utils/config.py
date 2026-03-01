@@ -4,10 +4,9 @@ import platform
 from functools import cache
 from os import getenv
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
-from . import json
+from ..backends import ConfigBackend, FileConfigBackend
 
 
 @cache
@@ -22,34 +21,29 @@ def get_config_path() -> Path:
 
 
 class Config(dict):
-    def __init__(self, config_path: str | Path | None = None):
-        self._config_path = Path(config_path or get_config_path())
-        self._lock = Lock()
+    """Конфигурация приложения с подключаемым бэкендом хранения.
+
+    Принимает Path/str (обратная совместимость) или ConfigBackend.
+    """
+
+    def __init__(self, source: str | Path | ConfigBackend | None = None) -> None:
+        if source is None:
+            self._backend = FileConfigBackend(get_config_path())
+        elif isinstance(source, ConfigBackend):
+            self._backend = source
+        else:
+            self._backend = FileConfigBackend(Path(source))
         self.load()
 
     def load(self) -> None:
-        if self._config_path.exists():
-            with self._lock:
-                with self._config_path.open(
-                    "r", encoding="utf-8", errors="replace"
-                ) as f:
-                    self.update(json.load(f))
+        if self._backend.exists():
+            self.update(self._backend.load())
 
     def save(self, *args: Any, **kwargs: Any) -> None:
         self.update(*args, **kwargs)
-        self._config_path.parent.mkdir(exist_ok=True, parents=True)
-        with self._lock:
-            with self._config_path.open(
-                "w+", encoding="utf-8", errors="replace"
-            ) as fp:
-                json.dump(
-                    self,
-                    fp,
-                    indent=2,
-                    sort_keys=True,
-                )
+        self._backend.save(dict(self))
 
     __getitem__ = dict.get
 
     def __repr__(self) -> str:
-        return str(self._config_path)
+        return f"Config({self._backend!r})"
