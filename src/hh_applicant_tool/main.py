@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import smtplib
@@ -222,7 +223,7 @@ class HHApplicantTool(MegaTool):
         token = config.get("token", {})
         return api.client.ApiClient(
             client_id=config.get("client_id"),
-            client_secret=config.get("client_id"),
+            client_secret=config.get("client_secret"),
             access_token=token.get("access_token"),
             refresh_token=token.get("refresh_token"),
             access_expires_at=token.get("access_expires_at"),
@@ -231,11 +232,38 @@ class HHApplicantTool(MegaTool):
             session=self.session,
         )
 
+    @cached_property
+    def async_api_client(self) -> api.async_client.AsyncApiClient:
+        """Ленивая инициализация async API-клиента.
+
+        Клиент разделяет конфигурацию токенов с sync-фасадом через один `config`.
+        """
+        args = self.args
+        config = self.config
+        token = config.get("token", {})
+        return api.async_client.AsyncApiClient(
+            client_id=config.get("client_id"),
+            client_secret=config.get("client_secret"),
+            access_token=token.get("access_token"),
+            refresh_token=token.get("refresh_token"),
+            access_expires_at=token.get("access_expires_at"),
+            delay=args.api_delay or config.get("api_delay"),
+            user_agent=args.user_agent or config.get("user_agent"),
+        )
+
     def get_me(self) -> api.datatypes.User:
         return self.api_client.get("/me")
 
+    async def aget_me(self) -> api.datatypes.User:
+        """Возвращает профиль текущего пользователя через async API."""
+        return await self.async_api_client.get("/me")
+
     def get_resumes(self) -> list[api.datatypes.Resume]:
         return self.api_client.get("/resumes/mine").get("items", [])
+
+    async def aget_resumes(self) -> list[api.datatypes.Resume]:
+        """Возвращает список резюме пользователя через async API."""
+        return (await self.async_api_client.get("/resumes/mine"))["items"]
 
     def first_resume_id(self) -> str:
         resume = self.get_resumes()[0]
@@ -246,6 +274,18 @@ class HHApplicantTool(MegaTool):
         for page in count():
             r: api.datatypes.PaginatedItems[api.datatypes.EmployerShort] = (
                 self.api_client.get("/employers/blacklisted", page=page)
+            )
+            rv += [item["id"] for item in r["items"]]
+            if page + 1 >= r["pages"]:
+                break
+        return rv
+
+    async def aget_blacklisted(self) -> list[str]:
+        """Итерирует все страницы blacklist и возвращает id работодателей."""
+        rv = []
+        for page in count():
+            r: api.datatypes.PaginatedItems[api.datatypes.EmployerShort] = (
+                await self.async_api_client.get("/employers/blacklisted", page=page)
             )
             rv += [item["id"] for item in r["items"]]
             if page + 1 >= r["pages"]:
@@ -273,6 +313,30 @@ class HHApplicantTool(MegaTool):
             if page + 1 >= r.get("pages", 0):
                 break
 
+    async def aget_negotiations(
+        self, status: str = "active"
+    ) -> list[api.datatypes.Negotiation]:
+        """Собирает все страницы переговоров заданного статуса.
+
+        Side effects:
+        - выполняет серию HTTP-запросов до исчерпания пагинации.
+        """
+        items_all: list[api.datatypes.Negotiation] = []
+        for page in count():
+            r: dict[str, Any] = await self.async_api_client.get(
+                "/negotiations",
+                page=page,
+                per_page=100,
+                status=status,
+            )
+            items = r.get("items", [])
+            if not items:
+                break
+            items_all.extend(items)
+            if page + 1 >= r.get("pages", 0):
+                break
+        return items_all
+
     # TODO: добавить еще методов или те удалить?
 
     def save_token(self) -> bool:
@@ -280,6 +344,15 @@ class HHApplicantTool(MegaTool):
             "access_token"
         ):
             self.config.save(token=self.api_client.get_access_token())
+            return True
+        return False
+
+    async def asave_token(self) -> bool:
+        """Сохраняет async-токен в конфиг, если access token изменился."""
+        if self.async_api_client.access_token != self.config.get("token", {}).get(
+            "access_token"
+        ):
+            self.config.save(token=self.async_api_client.get_access_token())
             return True
         return False
 
@@ -292,6 +365,23 @@ class HHApplicantTool(MegaTool):
             logger.warning(
                 f"Сессионные куки имеют неправильный тип: {type(self.session.cookies)}"
             )
+
+    async def arefresh_access_token(self) -> None:
+        """Принудительно обновляет access token в async-клиенте."""
+        await self.async_api_client.refresh_access_token()
+
+    async def aclose(self) -> None:
+        """Закрывает async/sync ресурсы фасада в безопасном порядке.
+
+        Метод идемпотентен на уровне вызовов: закрывает только уже
+        инициализированные ресурсы (`async_api_client`, `session`, `db`).
+        """
+        if "async_api_client" in self.__dict__:
+            await self.async_api_client.aclose()
+        if "session" in self.__dict__:
+            self.session.close()
+        if "db" in self.__dict__:
+            self.db.close()
 
     def get_openai_chat(self, system_prompt: str) -> ai.ChatOpenAI:
         c = self.config.get("openai", {})
@@ -412,6 +502,10 @@ class HHApplicantTool(MegaTool):
             except Exception:
                 pass
                 # raise
+            try:
+                asyncio.run(self.aclose())
+            except Exception:
+                pass
 
     def _parse_args(self, argv) -> None:
         self._parser = self._create_parser()
