@@ -21,6 +21,7 @@ import requests
 import urllib3
 
 from . import ai, api, utils
+from .backends import ConfigBackend, CookieBackend
 from .storage import StorageFacade
 from .utils.cookiejar import HHOnlyCookieJar
 from .utils.log import setup_logger
@@ -36,6 +37,20 @@ DEFAULT_COOKIES_FILENAME = "cookies.txt"
 DEFAULT_DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 logger = logging.getLogger(__package__)
+
+
+class BackendConfig(dict):
+    """Конфиг-обертка над кастомным backend."""
+
+    def __init__(self, backend: ConfigBackend):
+        self._backend = backend
+        super().__init__()
+        if backend.exists():
+            self.update(backend.load())
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.update(*args, **kwargs)
+        self._backend.save(dict(self))
 
 
 class BaseOperation:
@@ -133,7 +148,14 @@ class HHApplicantTool(MegaTool):
         parser.set_defaults(run=None)
         return parser
 
-    def __init__(self, argv: Sequence[str] | None):
+    def __init__(
+        self,
+        argv: Sequence[str] | None,
+        config_backend: ConfigBackend | None = None,
+        cookie_backend: CookieBackend | None = None,
+    ):
+        self._config_backend = config_backend
+        self._cookie_backend = cookie_backend
         self._parse_args(argv)
 
         # Создаем путь до конфига
@@ -192,7 +214,9 @@ class HHApplicantTool(MegaTool):
         ).resolve()
 
     @cached_property
-    def config(self) -> utils.Config:
+    def config(self) -> utils.Config | BackendConfig:
+        if self._config_backend is not None:
+            return BackendConfig(self._config_backend)
         return utils.Config(self.config_path / DEFAULT_CONFIG_FILENAME)
 
     @cached_property
@@ -360,6 +384,10 @@ class HHApplicantTool(MegaTool):
         """Сохраняет текущие куки сессии в файл."""
         if isinstance(self.session.cookies, MozillaCookieJar):
             self.session.cookies.save(ignore_discard=True, ignore_expires=True)
+            if self._cookie_backend is not None:
+                self._cookie_backend.save_from_text(
+                    self.cookies_file.read_text(encoding="utf-8")
+                )
             logger.debug("Cookies saved to %s", self.cookies_file)
         else:
             logger.warning(
