@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Protocol
 
+from .utils import json
+
 
 class ConfigBackend(Protocol):
-    """Протокол backend для хранения конфигурации пользователя."""
+    """Контракт backend для хранения конфигурации пользователя."""
 
     def exists(self) -> bool: ...
 
@@ -16,16 +17,18 @@ class ConfigBackend(Protocol):
 
 
 class CookieBackend(Protocol):
-    """Протокол backend для хранения cookies пользователя."""
+    """Контракт backend для хранения cookies пользователя."""
+
+    def exists(self) -> bool: ...
 
     def save_from_text(self, cookies_text: str) -> None: ...
 
 
 class FileConfigBackend:
-    """Файловый backend config.json с JSON-представлением."""
+    """Файловый backend `config.json`."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
 
     def exists(self) -> bool:
         return self._path.exists()
@@ -39,18 +42,23 @@ class FileConfigBackend:
         return dict(json.loads(raw))
 
     def save(self, data: dict[str, Any]) -> None:
+        current = self.load()
+        current.update(data)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            json.dumps(current, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
 
 
 class FileCookieBackend:
-    """Файловый backend cookies.txt."""
+    """Файловый backend `cookies.txt`."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+
+    def exists(self) -> bool:
+        return self._path.exists()
 
     def save_from_text(self, cookies_text: str) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
